@@ -1,103 +1,269 @@
-"""
-solution.py — the ONLY file a team has to implement.
-
-The organizers' harness (run_submission.py) imports this module and calls:
-
-    detect_events(video_path)  -> [[start_sec, end_sec, label], ...]    # Part A
-    RiskEstimator().reset(meta); .step(frame, t_sec) -> float           # Part B (optional)
-
-Keep the names and signatures exactly as they are. Everything else — models,
-tracking, rules, helper modules under src/ — is up to you.
-
-Labels must come from CLASSES. You may REMOVE classes you never predict;
-do not add new ids.
-"""
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+import cv2
 import numpy as np
 
-# Official class ids (14). See the task description for definitions and
-# start/end conventions. Remove entries you never predict; never add.
+from src.detector import Detector, VEHICLE_IDS, PEDESTRIAN_ID, TRAFFIC_LIGHT_ID
+from src.tracker import Tracker
+from src.geometry import SceneModel
+from src.signals import TrafficLightState
+from src.obstacles import ObstacleDetector, FireSmokeDetector
+from src.rules import (
+    _deceleration,
+    track_flags,
+    pair_flags,
+    crossing_flag,
+    congestion_flag,
+    stopline_flags,
+)
+from src.segments import flags_to_segments, clip_to_duration
+
 CLASSES: list[str] = [
-    "accident",            # collision between road users / with a fixed object
-    "near_miss",           # sharp braking or swerving to avoid a collision, no contact
-    "red_light",           # crossing the stop line on red
-    "wrong_way",           # driving against the traffic direction / in the oncoming lane
-    "illegal_u_turn",      # U-turn where prohibited
-    "stopped_vehicle",     # stationary on the carriageway >= 10 s, not queued at a signal
-    "jaywalking",          # pedestrian on the carriageway outside a crossing
-    "failure_to_yield",    # driving through a crossing while a pedestrian is on it
-    "illegal_turn",        # turn from the wrong lane or in a prohibited direction
-    "solid_line_crossing", # lane change / manoeuvre across a solid marking
-    "stop_line",           # stopped past the stop line on red
-    "congestion",          # standstill / crawling traffic across all lanes of a direction
-    "road_obstacle",       # debris, animal or fallen object on the carriageway
-    "fire_smoke",          # visible fire or smoke from a vehicle or on the road
+    "accident",
+    "near_miss",
+    "red_light",
+    "wrong_way",
+    "illegal_u_turn",
+    "stopped_vehicle",
+    "jaywalking",
+    "failure_to_yield",
+    "illegal_turn",
+    "solid_line_crossing",
+    "stop_line",
+    "congestion",
+    "road_obstacle",
+    "fire_smoke",
 ]
 
-# Anticipation horizon used by the metric (seconds). step() should return
-# P(an `accident` starts within the next RISK_HORIZON_SEC seconds).
 RISK_HORIZON_SEC = 5.0
+
+SAMPLE_STRIDE = int(os.environ.get("EVENT_SAMPLE_STRIDE", "3"))
+CALIB_SEC = float(os.environ.get("SCENE_CALIB_SEC", "15.0"))
+RECALIB_EVERY_SEC = 10.0
+YOLO_WEIGHTS = os.environ.get(
+    "YOLO_WEIGHTS",
+    "weights/yolov8n.pt",
+)
+YOLO_DEVICE = os.environ.get("YOLO_DEVICE") or None
+
+_detector = None
+
+
+def _get_detector():
+    global _detector
+    if _detector is None:
+        weights = Path(YOLO_WEIGHTS)
+        if not weights.is_absolute():
+            weights = Path(__file__).resolve().parent / weights
+        if not weights.exists():
+            fallback = Path(__file__).resolve().parent / "weights" / "yolov8n.pt"
+            weights = fallback
+        _detector = Detector(weights=str(weights), device=YOLO_DEVICE)
+    return _detector
+
+
+def _split_detections(boxes, cls_ids):
+    det_boxes, det_cls, tl_boxes = [], [], []
+    for box, c in zip(boxes, cls_ids):
+        if c in VEHICLE_IDS:
+            det_boxes.append(box)
+            det_cls.append("vehicle")
+        elif c == PEDESTRIAN_ID:
+            det_boxes.append(box)
+            det_cls.append("pedestrian")
+        elif c == TRAFFIC_LIGHT_ID:
+            tl_boxes.append(box)
+    return det_boxes, det_cls, tl_boxes
 
 
 def detect_events(video_path: str) -> list[list]:
-    """Part A — traffic event detection.
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
+    duration = frame_count / float(fps) if frame_count > 0 else 0.0
 
-    Args:
-        video_path: path to one .mp4 file. You may open it any way you like
-            (OpenCV, decord, PyAV, ffmpeg), read it several times, sample
-            frames, run batched models — anything goes.
+    detector = _get_detector()
+    tracker = Tracker()
+    scene = SceneModel(width, height)
+    tls = TrafficLightState()
+    obstacle_det = ObstacleDetector()
+    fire_det = FireSmokeDetector()
 
-    Returns:
-        A list of events, each ``[start_sec, end_sec, label]`` with
-        ``0 <= start_sec < end_sec <= duration`` (floats, seconds from the
-        first frame) and ``label in CLASSES``. Return ``[]`` if nothing
-        happened. Segments of the same class must not overlap.
+    times: list[float] = []
+    per_class_flags = {c: [] for c in CLASSES}
 
-    A typical pipeline:
-        1. sample frames (every 2nd–5th frame is usually enough),
-        2. detect road users (YOLO / RT-DETR) and track them (ByteTrack),
-        3. turn trajectories + scene layout (lanes, stop line, crossing)
-           into per-frame flags for each class,
-        4. merge consecutive flags into segments, drop blips < 0.5 s,
-           merge gaps < 1 s,
-        5. optionally re-score `accident` / `near_miss` candidates with a
-           learned clip classifier.
-    """
-    # TODO: replace this stub with your pipeline.
-    return []
+    frame_idx = 0
+    calibrated_once = False
+    last_duration = duration
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        t_sec = frame_idx / fps
+        last_duration = t_sec
+
+        if frame_idx % SAMPLE_STRIDE != 0:
+            frame_idx += 1
+            continue
+
+        boxes, cls_ids, _ = detector.infer(frame)
+        det_boxes, det_cls, tl_boxes = _split_detections(boxes, cls_ids)
+        tracks = tracker.update(det_boxes, det_cls, t_sec)
+
+        for tr in tracks:
+            scene.observe(tr)
+
+        if not calibrated_once and t_sec >= CALIB_SEC:
+            scene.calibrate()
+            calibrated_once = True
+        elif calibrated_once and frame_idx % max(1, int(fps * RECALIB_EVERY_SEC / SAMPLE_STRIDE)) == 0:
+            scene.calibrate()
+
+        tl_state = tls.update(frame, tl_boxes)
+
+        active = [t for t in tracks if t.time_since_update == 0]
+        frame_flags = {c: False for c in CLASSES}
+
+        for tr in active:
+            for k, v in track_flags(tr, scene).items():
+                frame_flags[k] = frame_flags[k] or v
+
+        accident, near_miss = pair_flags(active)
+        frame_flags["accident"] = accident
+        frame_flags["near_miss"] = near_miss
+        frame_flags["failure_to_yield"] = crossing_flag(active, scene)
+        frame_flags["congestion"] = congestion_flag(active, scene)
+
+        red_light, stop_line = stopline_flags(active, scene, tl_state)
+        frame_flags["red_light"] = red_light
+        frame_flags["stop_line"] = stop_line
+
+        frame_flags["road_obstacle"] = obstacle_det.update(frame, scene, active)
+        frame_flags["fire_smoke"] = fire_det.update(frame, scene)
+
+        times.append(t_sec)
+        for c in CLASSES:
+            per_class_flags[c].append(frame_flags[c])
+
+        frame_idx += 1
+
+    cap.release()
+
+    events: list[list] = []
+    for c in CLASSES:
+        events.extend(
+            flags_to_segments(
+                per_class_flags[c],
+                times,
+                c,
+                end_time=last_duration,
+            )
+        )
+    events = clip_to_duration(events, last_duration)
+    return events
+
+
+def _time_to_collision(a, b):
+    ca, cb = a.centroid(), b.centroid()
+    _, va = a.speed(0.6)
+    _, vb = b.speed(0.6)
+    rx, ry = cb[0] - ca[0], cb[1] - ca[1]
+    rvx, rvy = vb[0] - va[0], vb[1] - va[1]
+    rel_speed_sq = rvx ** 2 + rvy ** 2
+    if rel_speed_sq < 1e-6:
+        return None
+    t_closest = -(rx * rvx + ry * rvy) / rel_speed_sq
+    if t_closest <= 0:
+        return None
+    closest_dist = ((rx + rvx * t_closest) ** 2 + (ry + rvy * t_closest) ** 2) ** 0.5
+    scale = max(a.bbox[2] - a.bbox[0], b.bbox[2] - b.bbox[0], 1.0)
+    if closest_dist < scale * 1.5:
+        return t_closest
+    return None
+
+
+def _risk_from_tracks(tracks, scene=None):
+    """Return a causal accident risk using only current track histories."""
+    active = [t for t in tracks if t.time_since_update == 0]
+    min_ttc = None
+    for i in range(len(active)):
+        for j in range(i + 1, len(active)):
+            first, second = active[i], active[j]
+            if first.cls == "pedestrian" and second.cls == "pedestrian":
+                continue
+            if first.cls == "pedestrian" or second.cls == "pedestrian":
+                pedestrian = first if first.cls == "pedestrian" else second
+                vehicle = second if first.cls == "pedestrian" else first
+                if scene is not None and not scene.on_road(*pedestrian.centroid()):
+                    continue
+                distance = np.linalg.norm(
+                    np.subtract(pedestrian.centroid(), vehicle.centroid())
+                )
+                vehicle_width = max(vehicle.bbox[2] - vehicle.bbox[0], 1.0)
+                if distance > vehicle_width * 3.0:
+                    continue
+            ttc = _time_to_collision(first, second)
+            if ttc is not None and (min_ttc is None or ttc < min_ttc):
+                min_ttc = ttc
+
+    ttc_score = 0.0
+    if min_ttc is not None:
+        ttc_score = max(0.0, min(1.0, 1.0 - min_ttc / RISK_HORIZON_SEC))
+
+    braking_score = 0.0
+    for track in active:
+        if track.cls != "vehicle":
+            continue
+        braking_score = max(braking_score, min(1.0, _deceleration(track) / 60.0))
+
+    # TTC is the strongest signal; braking adds sensitivity before contact.
+    return max(ttc_score, 0.35 * braking_score)
 
 
 class RiskEstimator:
-    """Part B — causal accident anticipation (optional, bonus).
-
-    The harness calls ``reset(meta)`` once per video and then ``step`` for
-    EVERY frame, in order. ``step`` must use only the frames it has seen so
-    far: do not open the video file inside this class, and do not reuse
-    Part A results that were computed with access to future frames.
-    """
-
     def reset(self, meta: dict) -> None:
-        """Called once before the first frame of each video.
-
-        meta = {"video_id": str, "fps": float, "width": int, "height": int,
-                "n_frames": int}
-        """
-        self.meta = meta
+        self.fps = float(meta.get("fps") or 25.0)
+        self.width = int(meta.get("width") or 1)
+        self.height = int(meta.get("height") or 1)
+        self.detector = _get_detector()
+        self.tracker = Tracker()
+        self.scene = SceneModel(self.width, self.height)
+        self.frame_idx = 0
         self.last_score = 0.0
+        self.stride = SAMPLE_STRIDE
 
     def step(self, frame: np.ndarray, t_sec: float) -> float:
-        """Return P(accident starts within the next RISK_HORIZON_SEC s).
+        if self.frame_idx % self.stride != 0:
+            self.frame_idx += 1
+            return self.last_score
 
-        Args:
-            frame: BGR uint8 array of shape (H, W, 3) — OpenCV convention.
-            t_sec: timestamp of this frame in seconds.
+        boxes, cls_ids, _ = self.detector.infer(frame)
+        det_boxes, det_cls, _ = _split_detections(boxes, cls_ids)
+        return self.step_detections(det_boxes, det_cls, t_sec)
 
-        Returns:
-            A float in [0, 1]. Skipping frames internally and returning the
-            previous score is fine; the harness still expects a value for
-            every call.
-        """
-        # TODO: replace this stub. A simple strong baseline: track vehicles,
-        # estimate time-to-collision between pairs, map min TTC -> risk.
+    def step_detections(self, det_boxes, det_cls, t_sec: float) -> float:
+        """Update risk from detections already computed for the current frame."""
+        if self.frame_idx % self.stride != 0:
+            self.frame_idx += 1
+            return self.last_score
+
+        tracks = self.tracker.update(det_boxes, det_cls, t_sec)
+        for tr in tracks:
+            self.scene.observe(tr)
+        if self.frame_idx > 0 and self.frame_idx % max(1, int(self.fps * RECALIB_EVERY_SEC / self.stride)) == 0:
+            self.scene.calibrate()
+
+        active = [t for t in tracks if t.time_since_update == 0]
+        raw_score = _risk_from_tracks(active, self.scene)
+
+        self.last_score = max(raw_score, self.last_score * 0.85)
+        self.frame_idx += 1
         return self.last_score
