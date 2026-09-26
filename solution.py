@@ -250,7 +250,7 @@ class RiskEstimator:
         return self.step_detections(det_boxes, det_cls, t_sec)
 
     def step_detections(self, det_boxes, det_cls, t_sec: float) -> float:
-        """Update risk from detections already computed for the current frame."""
+        """Update risk a from detections already computed for the current frame."""
         if self.frame_idx % self.stride != 0:
             self.frame_idx += 1
             return self.last_score
