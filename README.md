@@ -23,6 +23,48 @@ python evaluate.py --pred predictions_samples.json --gt my_labels.json --per-vid
 python evaluate.py --pred predictions_samples.json --validate-only        # format check without labels
 ```
 
+After installing the requirements, a complete local run is one command:
+
+```bash
+python run_submission.py --videos samples --out predictions_samples.json --team local
+```
+
+For an organizer-uploaded video, put the newest file in `incoming/` and run
+one command. The script selects the newest supported video extension
+(`mp4`, `mov`, `avi`, `mkv`, `webm`, `wmv`, `ts`, and others), converts it to
+MP4, and starts the detector:
+
+```bash
+python run_latest.py --input incoming --out predictions_latest.json --team local
+```
+
+The conversion uses OpenCV. If the source codec is not included in the
+installed OpenCV build, install FFmpeg on the machine or provide the video in
+an OpenCV-readable format.
+
+The command uses the standard pretrained `weights/yolov8n.pt`. The model
+weights are intentionally not part of the Python dependencies and must be
+copied/downloaded separately on a new device.
+
+An experimental pseudo-label training run over all files in `samples/` is
+stored at
+`runs/detect/runs/detect/all_samples_pseudo/weights/best.pt`. It was trained
+from YOLO's own detections, so it is not a substitute for manually verified
+labels. It is kept only as an experiment and is not used by the normal
+pipeline. To test it manually without changing source code, set the model
+path in `solution.py` temporarily.
+
+```powershell
+# temporarily change YOLO_WEIGHTS = "..." in solution.py for this experiment
+python run_submission.py --videos samples --out predictions_pseudo.json --team pseudo
+```
+
+Run the dependency-free regression tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## The interface (`solution.py`)
 
 ```python

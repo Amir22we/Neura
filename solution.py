@@ -43,10 +43,9 @@ RISK_HORIZON_SEC = 5.0
 SAMPLE_STRIDE = int(os.environ.get("EVENT_SAMPLE_STRIDE", "3"))
 CALIB_SEC = float(os.environ.get("SCENE_CALIB_SEC", "15.0"))
 RECALIB_EVERY_SEC = 10.0
-YOLO_WEIGHTS = os.environ.get(
-    "YOLO_WEIGHTS",
-    "weights/yolov8n.pt",
-)
+# Keep the submission on the standard pretrained detector. Experimental
+# training artifacts may remain in the repository but are not used here.
+YOLO_WEIGHTS = "weights/yolov8n.pt"
 YOLO_DEVICE = os.environ.get("YOLO_DEVICE") or None
 
 _detector = None
