@@ -1,0 +1,10 @@
+path: C:/Users/User/Downloads/wiut_cv_scripts/wiut_cv_scripts/datasets/all_samples_pseudo
+train: images/train
+val: images/val
+names:
+  0: car
+  1: truck
+  2: bus
+  3: motorcycle
+  4: pedestrian
+  5: traffic_light
