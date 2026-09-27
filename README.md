@@ -12,7 +12,7 @@ examples/            <- ground_truth.json and predictions.json in the exact form
 requirements.txt     <- numpy + opencv for the harness; add your own deps to YOUR repo
 ```
 
-## Quickstart
+## Quickstart.
 
 ```bash
 pip install -r requirements.txt
